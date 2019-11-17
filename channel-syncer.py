@@ -8,6 +8,17 @@ from queue import Queue
 import pyrogram
 from pyrogram import Client, MessageHandler, Message, Filters, RawUpdateHandler, Update
 
+def press_to_exit(app: Client):
+	while True:
+		try:
+			while input() != 'exit': pass
+			break
+		except InterruptedError:
+			break
+	app.stop()
+	while app.q.running: time.sleep(0.5)
+	raise SystemExit
+
 class sqlite_object(Thread):
 	def __init__(self, client: Client, config: ConfigParser):
 		Thread.__init__(self, daemon=True)
@@ -22,6 +33,7 @@ class sqlite_object(Thread):
 		self.listen_group = int(self.config['channel']['listen_group'])
 		self.fwd_to = int(self.config['channel']['fwd_to'])
 		self.split_sticker = self.config['channel']['split_sticker']
+		self.running = True
 
 	def run(self):
 		self.db_conn = sqlite3.connect('channel-no.db')
@@ -41,6 +53,8 @@ class sqlite_object(Thread):
 				self.handle_edit_message(self.client, msg)
 			elif action == 'del':
 				self.delete_message(msg)
+			elif action == 'exit':
+				self.close()
 		except:
 			self.logger.exception('Catched exception')
 
@@ -56,8 +70,8 @@ class sqlite_object(Thread):
 	def delete_message(self, msgs: list):
 		try:
 			target_ids = self.request_target_message_id(msgs)
-			if len(target_ids) == 0:
-				return self.client.send_message(self.listen_group, '[WARNING] delete message failed.', disable_notification=True)
+			if not target_ids:
+				return self.client.send_message(self.notify_to, '[WARNING] delete message failed.', disable_notification=True)
 			self.client.delete_messages(self.fwd_to, target_ids)
 		except pyrogram.errors.RPCError:
 			self.client.send_message('Got rpc error, see console to get more information')
@@ -80,6 +94,7 @@ class sqlite_object(Thread):
 			self.db_conn.commit()
 			self.conn.close()
 			self.db_conn.close()
+			self.running = False
 
 	def insert_into_db(self, msg: Message, r_msg: Message):
 		if r_msg is None: return
@@ -100,6 +115,10 @@ class sqlite_object(Thread):
 		self.insert_into_db(msg, r_msg)
 		self.commit()
 
+	@staticmethod
+	def getCaption(msg: Message):
+		return msg.caption if msg.caption is not None else ""
+
 	def handle_comment(self, client: Client, msg: Message):
 		r_msg = None
 		if msg.reply_to_message and not msg.reply_to_message.empty:
@@ -112,7 +131,7 @@ class sqlite_object(Thread):
 		if msg_type == 'text':
 			r_msg = client.send_message(self.fwd_to, msg.text, reply_to_message_id=r_id, disable_web_page_preview=not msg.web_page)
 		else:
-			r_msg = client.send_cached_media(self.fwd_to, getattr(msg, msg_type).file_id, msg.caption, reply_to_message_id=r_id)
+			r_msg = client.send_cached_media(self.fwd_to, getattr(msg, msg_type).file_id, getattr(msg, msg_type).file_ref, self.getCaption(msg), reply_to_message_id=r_id)
 		self.insert_into_db(msg, r_msg)
 		self.commit()
 
@@ -162,6 +181,10 @@ class forward_thread:
 	def idle(self):
 		self.app.idle()
 
+	def stop(self):
+		self.q.queue.put_nowait(('exit', None))
+		self.app.stop()
+
 	def handle_raw_update(self, _client: Client, update: Update, _chats: dict, _users: dict):
 		if isinstance(update, pyrogram.api.types.UpdateDeleteChannelMessages) and \
 			(-(update.channel_id + 1000000000000) == self.listen_group):
@@ -180,4 +203,4 @@ if __name__ == "__main__":
 	f = forward_thread()
 	f.start()
 	#f.spider()
-	f.idle()
+	press_to_exit(f)
