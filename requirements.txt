@@ -1,2 +1,2 @@
-pyrogram==0.16.0
-tgcrypto
+pyrogram~=1.0.7
+aiosqlite~=0.15.0
