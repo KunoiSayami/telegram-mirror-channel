@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # channel-syncer.py
-# Copyright (C) 2019-2020 KunoiSayami
+# Copyright (C) 2019-2021 KunoiSayami
 #
 # This module is part of telegram-mirror-channel and is released under
 # the AGPL v3 License: https://www.gnu.org/licenses/agpl-3.0.txt
@@ -125,8 +125,8 @@ class SqliteObject:
         async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
             target_id = await self.query_target_id(msg.message_id, db)
         text = msg.text if msg.text else msg.caption
-        (client.edit_message_text if self.get_msg_type(msg) == 'text' else client.edit_message_caption)(self.fwd_to,
-                                                                                                        target_id, text)
+        await (client.edit_message_text if self.get_msg_type(msg) == 'text' else client.edit_message_caption
+               )(self.fwd_to, target_id, text)
 
     @staticmethod
     def get_msg_type(msg: Message) -> str:
@@ -151,7 +151,7 @@ class ForwardController:
             config.get('account', 'api_id'),
             config.get('account', 'api_hash'),
         )
-        self.q = SqliteObject(self.app, config)
+        self.q = SqliteObject(self.app, config, 'channel-no.db')
 
         self.app.add_handler(MessageHandler(self.handle_edit_message, filters.chat(self.listen_group) & filters.edited))
         self.app.add_handler(MessageHandler(self.handle_incoming_message, filters.chat(self.listen_group)))
