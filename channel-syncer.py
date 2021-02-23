@@ -21,7 +21,8 @@
 import asyncio
 import logging
 from configparser import ConfigParser
-from typing import List, Union
+from concurrent.futures import Future
+from typing import Iterator, Optional
 
 import aiosqlite
 import pyrogram
@@ -32,7 +33,7 @@ from pyrogram.types import Message, Update
 
 
 class SqliteObject:
-    def __init__(self, client: Client, config: ConfigParser, file_name):
+    def __init__(self, client: Client, config: ConfigParser, file_name: str):
         self.db_conn = None
         self.conn = None
         self.client = client
@@ -44,18 +45,7 @@ class SqliteObject:
         self.split_sticker = config.get('channel', 'split_sticker')
         self.file_name: str = file_name
 
-    async def do_sth(self, action: str, msg: Union[Message, List[int]]) -> None:
-        try:
-            if action == 'normal':
-                await self.handle_incoming_message(self.client, msg)
-            elif action == 'edit':
-                await self.handle_edit_message(self.client, msg)
-            elif action == 'del':
-                await self.delete_message(msg)
-        except:
-            self.logger.exception('Caught exception')
-
-    async def request_target_message_id(self, message_ids: List[int], db: aiosqlite.Connection) -> List[int]:
+    async def request_target_message_id(self, message_ids: list[int], db: aiosqlite.Connection) -> list[int]:
         r = []
         for x in message_ids:
             try:
@@ -64,7 +54,7 @@ class SqliteObject:
                 self.logger.exception(f'message_id: {x} not found')
         return r
 
-    async def delete_message(self, msgs: List[int]) -> None:
+    async def delete_message(self, msgs: list[int]) -> None:
         try:
             async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
                 target_ids = await self.request_target_message_id(msgs, db)
@@ -84,20 +74,16 @@ class SqliteObject:
                 pass
             await db.commit()
 
+    async def insert_many(self, data: Iterator[tuple[int, int]]) -> None:
+        async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
+            async with db.executemany("INSERT INTO `id_mapping` VALUES (?, ?)", data):
+                pass
+            await db.commit()
+
     @staticmethod
     async def query_target_id(origin_id: int, db: aiosqlite.Connection):
         async with db.execute("SELECT `target_id` FROM `id_mapping` WHERE `origin_id` = ?", (origin_id,)) as cursor:
             return (await cursor.fetchone())[0]
-
-    async def handle_incoming_message(self, client: Client, msg: Message) -> None:
-        if msg.sticker and msg.sticker.file_id == self.split_sticker:
-            r_msg = await client.send_sticker(self.fwd_to, msg.sticker.file_id)
-        elif msg.forward_from or msg.forward_sender_name or msg.forward_from_chat:
-            r_msg = await msg.forward(self.fwd_to)
-        else:
-            await self.handle_comment(client, msg)
-            return
-        await self.insert_into_db(msg, r_msg)
 
     @staticmethod
     def get_caption(msg: Message) -> str:
@@ -116,8 +102,7 @@ class SqliteObject:
             r_msg = await client.send_message(self.fwd_to, msg.text, reply_to_message_id=r_id,
                                               disable_web_page_preview=not msg.web_page)
         else:
-            r_msg = await client.send_cached_media(self.fwd_to, getattr(msg, msg_type).file_id,
-                                                   getattr(msg, msg_type).file_ref, self.get_caption(msg),
+            r_msg = await client.send_cached_media(self.fwd_to, getattr(msg, msg_type).file_id, self.get_caption(msg),
                                                    reply_to_message_id=r_id)
         await self.insert_into_db(msg, r_msg)
 
@@ -138,6 +123,68 @@ class SqliteObject:
             'voice' if msg.voice else 'error'
 
 
+class Watcher:
+    def __init__(self, client: Client, forward_to: int, sqlite: SqliteObject):
+        self.client = client
+        self.stop_event = asyncio.Event()
+        self.queue = asyncio.Queue()
+        self.sync_lock = asyncio.Lock()
+        self.forward_to = forward_to
+        self.sqlite = sqlite
+        self.coroutine: Optional[Future] = None
+
+    def set_stop(self) -> None:
+        self.stop_event.set()
+
+    async def put(self, msg: Message) -> None:
+        async with self.sync_lock:
+            self.queue.put_nowait(msg)
+
+    async def monitor(self) -> None:
+        while not self.stop_event.is_set():
+            if not self.queue.empty():
+                await self.forward_messages()
+            await asyncio.sleep(1.5)
+        self.coroutine = None
+
+    def start(self) -> None:
+        if self.coroutine is not None:
+            return
+        self.sqlite.logger.info('Start watcher')
+        self.coroutine = asyncio.run_coroutine_threadsafe(self.monitor(), asyncio.get_event_loop())
+
+    def wait(self, timeout: float = 1.) -> None:
+        if self.coroutine is None:
+            return
+        self.coroutine.result(timeout)
+
+    async def forward_messages(self) -> None:
+        async with self.sync_lock:
+            original_msg, forwarded_msg, pending_forward = [], [], []
+            while not self.queue.empty():
+                msg = self.queue.get_nowait()
+                if msg.sticker and msg.sticker.file_unique_id == self.sqlite.split_sticker:
+                    r_msg = await self.client.send_sticker(self.forward_to, msg.sticker.file_id,
+                                                           disable_notification=True)
+                    original_msg.append(msg.message_id)
+                    forwarded_msg.append(r_msg.message_id)
+                elif msg.forward_from or msg.forward_sender_name or msg.forward_from_chat:
+                    pending_forward.append(msg)
+                else:
+                    if pending_forward:
+                        msg_ids = [x.message_id for x in pending_forward]
+                        fmsgs = await self.client.forward_messages(self.forward_to, pending_forward[0].chat.id, msg_ids)
+                        if len(msg_ids) != len(fmsgs):
+                            self.sqlite.logger.warning('Forward message length not equal! (except %d but %d found)',
+                                                       len(msg_ids), len(fmsgs))
+                        original_msg.extend([msg.message_id for msg in fmsgs])
+                        await self.sqlite.insert_many(zip(original_msg, forwarded_msg))
+                        original_msg, forwarded_msg, pending_forward = [], [], []
+                    await self.sqlite.handle_comment(self.client, msg)
+            if original_msg and forwarded_msg:
+                await self.sqlite.insert_many(zip(original_msg, forwarded_msg))
+
+
 class ForwardController:
     def __init__(self):
         config = ConfigParser()
@@ -151,28 +198,40 @@ class ForwardController:
             config.get('account', 'api_id'),
             config.get('account', 'api_hash'),
         )
-        self.q = SqliteObject(self.app, config, 'channel-no.db')
+        self.q = SqliteObject(self.app, config, config.get('database', 'file', fallback='channel-no.db'))
+        self.watcher = Watcher(self.app, self.fwd_to, self.q)
 
+        self.app.add_handler(MessageHandler(self.handle_toggle, filters.chat(self.listen_group) &
+                                            filters.command('toggle')))
         self.app.add_handler(MessageHandler(self.handle_edit_message, filters.chat(self.listen_group) & filters.edited))
         self.app.add_handler(MessageHandler(self.handle_incoming_message, filters.chat(self.listen_group)))
         self.app.add_handler(RawUpdateHandler(self.handle_raw_update))
+        self.enabled = True
 
     async def start(self):
+        self.watcher.start()
         await self.app.start()
 
     async def stop(self):
+        self.watcher.set_stop()
         await self.app.stop()
 
     async def handle_raw_update(self, _client: Client, update: Update, _chats: dict, _users: dict):
         if isinstance(update, pyrogram.raw.types.UpdateDeleteChannelMessages) and \
                 (-(update.channel_id + 1000000000000) == self.listen_group):
-            await self.q.do_sth('del', update.messages)
+            await self.q.delete_message(update.messages)
 
-    async def handle_edit_message(self, _, msg: Message) -> None:
-        await self.q.do_sth('edit', msg)
+    async def handle_edit_message(self, client: Client, msg: Message) -> None:
+        await self.q.handle_edit_message(client, msg)
+
+    async def handle_toggle(self, _client: Client, msg: Message) -> None:
+        self.enabled = not self.enabled
+        await msg.reply(f'Set status to: {self.enabled}')
 
     async def handle_incoming_message(self, _, msg: Message) -> None:
-        await self.q.do_sth('normal', msg)
+        if not self.enabled:
+            return
+        await self.watcher.put(msg)
 
 
 async def main() -> None:
