@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # channel-syncer.py
-# Copyright (C) 2019-2021 KunoiSayami
-#
-# This module is part of telegram-mirror-channel and is released under
-# the AGPL v3 License: https://www.gnu.org/licenses/agpl-3.0.txt
+# Copyright (C) 2019-2022 KunoiSayami
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -28,7 +25,7 @@ import aiosqlite
 import pyrogram
 from pyrogram import Client, filters
 from pyrogram.errors import RPCError
-from pyrogram.handlers import MessageHandler, RawUpdateHandler
+from pyrogram.handlers import MessageHandler, RawUpdateHandler, EditedMessageHandler
 from pyrogram.types import Message, Update
 
 
@@ -70,7 +67,7 @@ class SqliteObject:
         if r_msg is None:
             return
         async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
-            async with db.execute("INSERT INTO `id_mapping` VALUES (?, ?)", (msg.message_id, r_msg.message_id)):
+            async with db.execute("INSERT INTO `id_mapping` VALUES (?, ?)", (msg.id, r_msg.id)):
                 pass
             await db.commit()
 
@@ -92,7 +89,7 @@ class SqliteObject:
     async def handle_comment(self, client: Client, msg: Message) -> None:
         if msg.reply_to_message and not msg.reply_to_message.empty:
             async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
-                r_id = await self.query_target_id(msg.reply_to_message.message_id, db)
+                r_id = await self.query_target_id(msg.reply_to_message.id, db)
         else:
             r_id = None
         msg_type = self.get_msg_type(msg)
@@ -108,7 +105,7 @@ class SqliteObject:
 
     async def handle_edit_message(self, client: Client, msg: Message) -> None:
         async with self.execute_lock, aiosqlite.connect(self.file_name) as db:
-            target_id = await self.query_target_id(msg.message_id, db)
+            target_id = await self.query_target_id(msg.id, db)
         text = msg.text if msg.text else msg.caption
         await (client.edit_message_text if self.get_msg_type(msg) == 'text' else client.edit_message_caption
                )(self.fwd_to, target_id, text)
@@ -158,6 +155,16 @@ class Watcher:
             return
         self.coroutine.result(timeout)
 
+    async def do_forward_message(self, pending_forward: list[Message]) -> None:
+        original_msg = [x.id for x in pending_forward]
+        fmsgs = await self.client.forward_messages(self.forward_to, pending_forward[0].chat.id, original_msg)
+        if len(original_msg) != len(fmsgs):
+            self.sqlite.logger.warning('Forward message length not equal! (except %d but %d found)',
+                                       len(original_msg), len(fmsgs))
+        forwarded_msg = [msg.id for msg in fmsgs]
+        await self.sqlite.insert_many(zip(original_msg, forwarded_msg))
+        pending_forward.clear()
+
     async def forward_messages(self) -> None:
         async with self.sync_lock:
             original_msg, forwarded_msg, pending_forward = [], [], []
@@ -166,21 +173,16 @@ class Watcher:
                 if msg.sticker and msg.sticker.file_unique_id == self.sqlite.split_sticker:
                     r_msg = await self.client.send_sticker(self.forward_to, msg.sticker.file_id,
                                                            disable_notification=True)
-                    original_msg.append(msg.message_id)
-                    forwarded_msg.append(r_msg.message_id)
+                    original_msg.append(msg.id)
+                    forwarded_msg.append(r_msg.id)
                 elif msg.forward_from or msg.forward_sender_name or msg.forward_from_chat:
                     pending_forward.append(msg)
                 else:
                     if pending_forward:
-                        msg_ids = [x.message_id for x in pending_forward]
-                        fmsgs = await self.client.forward_messages(self.forward_to, pending_forward[0].chat.id, msg_ids)
-                        if len(msg_ids) != len(fmsgs):
-                            self.sqlite.logger.warning('Forward message length not equal! (except %d but %d found)',
-                                                       len(msg_ids), len(fmsgs))
-                        original_msg.extend([msg.message_id for msg in fmsgs])
-                        await self.sqlite.insert_many(zip(original_msg, forwarded_msg))
-                        original_msg, forwarded_msg, pending_forward = [], [], []
+                        await self.do_forward_message(pending_forward)
                     await self.sqlite.handle_comment(self.client, msg)
+            if pending_forward:
+                await self.do_forward_message(pending_forward)
             if original_msg and forwarded_msg:
                 await self.sqlite.insert_many(zip(original_msg, forwarded_msg))
 
@@ -203,7 +205,7 @@ class ForwardController:
 
         self.app.add_handler(MessageHandler(self.handle_toggle, filters.chat(self.listen_group) &
                                             filters.command('toggle')))
-        self.app.add_handler(MessageHandler(self.handle_edit_message, filters.chat(self.listen_group) & filters.edited))
+        self.app.add_handler(EditedMessageHandler(self.handle_edit_message, filters.chat(self.listen_group)))
         self.app.add_handler(MessageHandler(self.handle_incoming_message, filters.chat(self.listen_group)))
         self.app.add_handler(RawUpdateHandler(self.handle_raw_update))
         self.enabled = True
@@ -252,4 +254,4 @@ if __name__ == "__main__":
     except ModuleNotFoundError:
         logging.basicConfig(level=logging.DEBUG,
                             format='%(asctime)s - %(levelname)s - %(funcName)s - %(lineno)d - %(message)s')
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())
